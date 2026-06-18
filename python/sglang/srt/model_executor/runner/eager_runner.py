@@ -61,6 +61,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.utils import is_hip, require_mlp_tp_gather
+from sglang.srt.utils.common import ceil_align, require_mlp_sync
 
 logger = logging.getLogger(__name__)
 
@@ -139,14 +140,24 @@ class EagerRunner(BaseRunner):
             # Frozen-KV MTP expands the draft batch by topk on the bs axis
             # (expand_for_topk_draft) before the eager fallback.
             max_bs *= sa.speculative_eagle_topk
+        # Under MLP sync the scheduler pads real batches in prepare_mlp_sync_batch
+        # (ceil-align to attn_tp_size, then to the CP padding size) and
+        # _dummy_run no longer re-pads. Mirror that full padding on the bs ceiling
+        # so the registry holds the padded batch load_batch copies in, and
+        # autotune tunes at the shape the scheduler produces.
+        if require_mlp_sync(sa):
+            from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+
+            max_bs = ceil_align(max_bs, self.attn_tp_size)
+            max_bs = ceil_align(max_bs, get_cp_padding_align_size())
         prefill_ceiling = (
-            sa.chunked_prefill_size
+            sa.max_prefill_buffer_tokens()
             if sa.chunked_prefill_size and sa.chunked_prefill_size > 0
             else mr.max_total_num_tokens
         )
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_bs)
         # Kept for _autotune_buffers(): the flashinfer-autotune dummy forward
-        # reuses this registry at its own bs ceiling (max_bs), no padded ceiling.
+        # reuses this registry at its own bs ceiling (max_bs, MLP-sync aligned).
         self._eager_max_bs = max_bs
         self._eager_num_tokens_per_bs = num_tokens_per_bs
         is_encoder_decoder = mr.model_config.is_encoder_decoder
@@ -182,7 +193,9 @@ class EagerRunner(BaseRunner):
         sourced from the registry's already-allocated slot buffers where present.
         Autotune runs at the registry's own bs ceiling (_eager_max_bs) — the
         eager fallback only ever sees batches <= max_running_requests, so tuning
-        at that size suffices; we deliberately do NOT pad to a larger ceiling.
+        at that size suffices; under MLP sync _eager_max_bs mirrors the
+        scheduler's padding (attn_tp_size then CP) so the registry holds the
+        padded batch and the tuned shape matches the scheduler's.
 
         Fields the registry omits:
           - next_token_logits_buffer -> None (dropped; a live autotune forward

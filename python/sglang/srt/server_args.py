@@ -22,6 +22,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import random
 import socket
@@ -3715,6 +3716,27 @@ class ServerArgs:
         decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
         decode_tokens = decode_max_bs * num_tokens_per_bs
         return max(prefill_tokens, decode_tokens)
+
+    def max_prefill_buffer_tokens(self) -> int:
+        """Largest token count a single prefill forward can issue, for sizing
+        static prefill buffers (e.g. the eager runner's). With chunked prefill a
+        forward is capped at ``chunked_prefill_size`` (PrefillAdder admits
+        against the remaining chunk budget) -- except under PP dynamic chunking,
+        where the predictor can grow a chunk toward ``max_prefill_tokens`` and
+        the latency profiler probes prefill at ``chunked_prefill_size * 1.25``.
+        So only the dynamic-chunking case needs more than ``chunked_prefill_size``.
+        """
+        chunked = (
+            self.chunked_prefill_size
+            if self.chunked_prefill_size and self.chunked_prefill_size > 0
+            else 0
+        )
+        tokens = chunked
+        if self.enable_dynamic_chunking and self.pp_size > 1 and chunked:
+            tokens = max(
+                tokens, self.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
+            )
+        return tokens
 
     def _validate_cutedsl_a2a_token_budget(self):
         """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
